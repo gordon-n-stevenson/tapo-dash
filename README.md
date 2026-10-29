@@ -37,6 +37,8 @@ Tapo plugs supported by python-kasa should work.
 - **Edit layout**: rename plugs and sockets and drag cards into your own order.
   Names set here override the plug's own, which helps for a P300 (the Tapo app
   only names its sockets) and for plugs paired to another account.
+- **Hide offline** toggle to declutter the grid; remembered per browser, with
+  a note saying how many plugs are hidden.
 - Optional view-only mode (`ALLOW_CONTROL=false`).
 
 ## Quick start

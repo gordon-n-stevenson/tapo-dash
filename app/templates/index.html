@@ -75,6 +75,8 @@
                 background:var(--lamp-off)}
   .auto input:checked + .track::after{left:16px;background:var(--lamp-on);box-shadow:0 0 6px var(--lamp-glow)}
   .auto input:focus-visible + .track{outline:2px solid var(--signal);outline-offset:2px}
+  .hidden-note{color:var(--muted);font-size:.82rem;margin-top:.75rem}
+  .hidden-note button{padding:.15rem .55rem;font-size:.78rem;margin-left:.4rem}
 
   #err{display:none;background:var(--fault-bg);border:1px solid var(--fault);border-left-width:5px;
        color:var(--text);padding:.7rem .9rem;border-radius:8px;font-size:.84rem;
@@ -252,6 +254,9 @@
     <label class="auto">
       <input type="checkbox" id="auto" checked><span class="track"></span>Auto-refresh
     </label>
+    <label class="auto">
+      <input type="checkbox" id="hide-offline"><span class="track"></span>Hide offline
+    </label>
   </div>
   <div class="edit-hint" id="edit-hint" hidden>
     Rename plugs and sockets (leave a name blank to use the plug's own), and drag cards
@@ -260,6 +265,7 @@
 
   <div id="err" role="alert"></div>
   <div class="grid" id="grid"></div>
+  <div class="hidden-note" id="hidden-note" hidden></div>
   <div class="empty" id="empty" style="display:none"></div>
 
   <section class="sched" id="sched" hidden>
@@ -465,9 +471,34 @@ const editBtn = document.getElementById('edit');
 const editHint = document.getElementById('edit-hint');
 editBtn.hidden = !ALLOW_CONTROL;
 
+// "Hide offline" is a per-browser viewing preference. Storage can be
+// unavailable (private mode, blocked site data), so the page must work without it.
+const HIDE_KEY = 'tapo-dash.hideOffline';
+const hideBox = document.getElementById('hide-offline');
+const hiddenNote = document.getElementById('hidden-note');
+try { hideBox.checked = localStorage.getItem(HIDE_KEY) === '1'; } catch (e) { /* default: show all */ }
+
 function renderGrid() {
-  grid.innerHTML = lastDevices.map(card).join('');
+  // Edit mode always shows every card so moves map onto the saved order.
+  const hide = hideBox.checked && !editing;
+  const shown = hide ? lastDevices.filter(d => d.online) : lastDevices;
+  grid.innerHTML = shown.map(card).join('');
+  const n = lastDevices.length - shown.length;
+  hiddenNote.hidden = n === 0;
+  hiddenNote.innerHTML = n
+    ? `${n} offline plug${n === 1 ? '' : 's'} hidden<button type="button" id="show-offline">Show</button>`
+    : '';
 }
+
+hideBox.onchange = () => {
+  try { localStorage.setItem(HIDE_KEY, hideBox.checked ? '1' : '0'); } catch (e) { /* not remembered */ }
+  renderGrid();
+};
+hiddenNote.addEventListener('click', ev => {
+  if (!ev.target.closest('#show-offline')) return;
+  hideBox.checked = false;
+  hideBox.onchange();
+});
 
 function showError(msg) {
   errBox.style.display = 'block';
