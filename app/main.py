@@ -12,6 +12,7 @@ import logging
 import os
 import sqlite3
 import time
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -20,11 +21,18 @@ from fastapi.requests import Request
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 import ipaddress
+from pydantic import BaseModel
 
 from kasa import Device, Discover, Module
 from kasa.exceptions import AuthenticationError
 
+from app import schedules
+
 log = logging.getLogger("tapo-dash")
+# uvicorn only configures its own loggers; without a root handler our info
+# lines (schedule runs, devices moving or being forgotten) are dropped.
+logging.basicConfig(format="%(levelname)s:     %(name)s: %(message)s")
+log.setLevel(logging.INFO)
 
 USERNAME = os.environ.get("TAPO_EMAIL", "")
 PASSWORD = os.environ.get("TAPO_PASSWORD", "")
@@ -315,7 +323,7 @@ class Registry:
     def by_mac(self, mac: str) -> Device:
         dev = self.devices.get(norm_mac(mac))
         if dev is None:
-            raise HTTPException(status_code=404, detail=f"unknown device {mac}")
+            raise LookupError(f"unknown device {mac}")
         return dev
 
     async def close(self) -> None:
@@ -352,6 +360,8 @@ def init_db() -> sqlite3.Connection | None:
 
 
 DB = init_db()
+if DB is not None:
+    schedules.init(DB)
 _last_history_write = 0.0
 
 
@@ -390,6 +400,7 @@ async def poller() -> None:
             if time.time() - registry.last_discovery > REDISCOVER_INTERVAL:
                 await registry.discover()
             await registry.poll_once()
+            await run_schedules()
             record_history()
         except asyncio.CancelledError:
             raise
@@ -467,29 +478,60 @@ async def history(mac: str, hours: int = 6):
     }
 
 
-async def _switch(mac: str, action: str, child_id: str | None = None) -> dict[str, Any]:
-    if not ALLOW_CONTROL:
-        raise HTTPException(status_code=403, detail="control is disabled")
+async def switch(mac: str, action: str, child_id: str | None = None) -> dict[str, Any]:
+    """Switch a plug, a whole strip, or one strip socket; return the new snapshot.
+
+    Raises LookupError for an unknown device or socket; anything else comes
+    from talking to the device.
+    """
     dev = registry.by_mac(mac)
     if child_id is not None:
         targets = [c for c in dev.children if c.device_id == child_id]
         if not targets:
-            raise HTTPException(status_code=404, detail=f"unknown socket {child_id}")
+            raise LookupError(f"unknown socket {child_id}")
     else:
         # Switching a whole strip means switching every socket on it.
         targets = list(dev.children) or [dev]
     async with registry.lock:
-        try:
-            if action == "toggle":
-                action = "off" if any(t.is_on for t in targets) else "on"
-            for target in targets:
-                await (target.turn_on() if action == "on" else target.turn_off())
-            await dev.update()
-        except Exception as exc:  # noqa: BLE001
-            raise HTTPException(status_code=502, detail=str(exc)) from exc
+        if action == "toggle":
+            action = "off" if any(t.is_on for t in targets) else "on"
+        for target in targets:
+            await (target.turn_on() if action == "on" else target.turn_off())
+        await dev.update()
         snap = registry._snapshot(norm_mac(mac), dev, time.time())
         registry.state[norm_mac(mac)] = snap
     return snap
+
+
+async def _switch(mac: str, action: str, child_id: str | None = None) -> dict[str, Any]:
+    if not ALLOW_CONTROL:
+        raise HTTPException(status_code=403, detail="control is disabled")
+    try:
+        return await switch(mac, action, child_id)
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+async def run_schedules() -> None:
+    """Fire every rule that is due. Called once per poll cycle."""
+    if DB is None or not ALLOW_CONTROL:
+        return
+    now = datetime.now().astimezone()
+    for rule in schedules.list_all(DB):
+        if not schedules.is_due(rule, now):
+            continue
+        target = rule["mac"] + (f"/{rule['child_id']}" if rule["child_id"] else "")
+        try:
+            await switch(rule["mac"], rule["action"], rule["child_id"])
+        except Exception as exc:  # noqa: BLE001
+            # Leave last_fired alone so the next cycle retries within GRACE.
+            log.warning("schedule %s (%s %s) failed: %s", rule["id"], rule["action"], target, exc)
+            schedules.record(DB, rule["id"], None, f"failed: {_short_error(exc)}")
+            continue
+        log.info("schedule %s: turned %s %s", rule["id"], rule["action"], target)
+        schedules.record(DB, rule["id"], now.date().isoformat(), f"ok {now:%H:%M:%S}")
 
 
 @app.post("/api/devices/{mac}/on")
@@ -512,6 +554,68 @@ async def switch_child(mac: str, child_id: str, action: str):
     if action not in ("on", "off", "toggle"):
         raise HTTPException(status_code=404, detail=f"unknown action {action}")
     return await _switch(mac, action, child_id)
+
+
+class ScheduleIn(BaseModel):
+    mac: str
+    child_id: str | None = None
+    action: str
+    at: str  # HH:MM, container-local time
+    days: str = schedules.ALL_DAYS  # Monday=0 .. Sunday=6
+
+
+class ScheduleUpdate(BaseModel):
+    enabled: bool
+
+
+def _schedules_db() -> sqlite3.Connection:
+    if not ALLOW_CONTROL:
+        raise HTTPException(status_code=403, detail="control is disabled")
+    if DB is None:
+        raise HTTPException(status_code=503, detail="schedules need the history database")
+    return DB
+
+
+@app.get("/api/schedules")
+async def list_schedules():
+    now = datetime.now().astimezone()
+    return {
+        "schedules": schedules.list_all(DB) if DB is not None else [],
+        "timezone": now.tzname(),
+        "now": now.strftime("%H:%M"),
+        "enabled": DB is not None and ALLOW_CONTROL,
+    }
+
+
+@app.post("/api/schedules", status_code=201)
+async def add_schedule(body: ScheduleIn):
+    db = _schedules_db()
+    mac = norm_mac(body.mac)
+    state = registry.state.get(mac)
+    if state is None:
+        raise HTTPException(status_code=404, detail=f"unknown device {body.mac}")
+    if body.child_id and body.child_id not in {c["id"] for c in state.get("children", [])}:
+        raise HTTPException(status_code=404, detail=f"unknown socket {body.child_id}")
+    try:
+        return schedules.add(
+            db, mac, body.child_id, body.action, body.at, body.days,
+            datetime.now().astimezone(),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
+@app.patch("/api/schedules/{rule_id}")
+async def update_schedule(rule_id: int, body: ScheduleUpdate):
+    if not schedules.set_enabled(_schedules_db(), rule_id, body.enabled):
+        raise HTTPException(status_code=404, detail=f"unknown schedule {rule_id}")
+    return schedules.get(DB, rule_id)
+
+
+@app.delete("/api/schedules/{rule_id}", status_code=204)
+async def delete_schedule(rule_id: int):
+    if not schedules.delete(_schedules_db(), rule_id):
+        raise HTTPException(status_code=404, detail=f"unknown schedule {rule_id}")
 
 
 @app.post("/api/rediscover")

@@ -58,6 +58,29 @@
   .socket button{padding:.25rem .6rem;font-size:.78rem}
   .errline{color:var(--bad);font-size:.72rem;word-break:break-word}
   .empty{color:var(--muted);text-align:center;padding:3rem 1rem;font-size:.9rem;line-height:1.6}
+  .sched{margin-top:2rem}
+  .sched h2{font-size:1.05rem;font-weight:650;margin-bottom:.75rem;display:flex;gap:.6rem;
+            align-items:baseline;flex-wrap:wrap}
+  .sched h2 small{color:var(--muted);font-weight:400;font-size:.78rem}
+  .sform{display:flex;flex-wrap:wrap;gap:.5rem;align-items:center;background:var(--surface);
+         border:1px solid var(--border);border-radius:12px;padding:.75rem;margin-bottom:.75rem}
+  .sform select,.sform input[type=time]{font:inherit;font-size:.85rem;color:var(--text);
+         background:var(--surface2);border:1px solid var(--border);border-radius:8px;
+         padding:.4rem .5rem;min-width:0;color-scheme:dark light}
+  #s-target{flex:1 1 220px}
+  .days{display:flex;gap:.25rem;flex-wrap:wrap}
+  .days label{font-size:.75rem;display:flex;align-items:center;gap:.2rem;cursor:pointer;
+              padding:.3rem .45rem;border:1px solid var(--border);border-radius:6px;background:var(--surface2)}
+  .days input{accent-color:var(--accent)}
+  .slist{display:flex;flex-direction:column;gap:.4rem}
+  .srow{display:flex;align-items:center;gap:.75rem;flex-wrap:wrap;background:var(--surface);
+        border:1px solid var(--border);border-radius:10px;padding:.55rem .75rem;font-size:.85rem}
+  .srow.paused{opacity:.5}
+  .srow .when{font-weight:650;font-variant-numeric:tabular-nums}
+  .srow .what{flex:1;min-width:0;word-break:break-word}
+  .srow button{padding:.25rem .6rem;font-size:.78rem}
+  .last{color:var(--muted);font-size:.74rem}
+  .last.bad{color:var(--bad)}
 </style>
 </head>
 <body>
@@ -79,6 +102,21 @@
   <div id="err"></div>
   <div class="grid" id="grid"></div>
   <div class="empty" id="empty" style="display:none"></div>
+
+  <section class="sched" id="sched" hidden>
+    <h2>Schedules <small id="s-tz"></small></h2>
+    <form class="sform" id="sform">
+      <select id="s-target" aria-label="Plug or socket" required></select>
+      <select id="s-action" aria-label="Action">
+        <option value="on">Turn on</option>
+        <option value="off">Turn off</option>
+      </select>
+      <input type="time" id="s-at" aria-label="Time" required>
+      <div class="days" id="s-days"></div>
+      <button type="submit">Add schedule</button>
+    </form>
+    <div class="slist" id="slist"></div>
+  </section>
 </div>
 
 <script>
@@ -191,6 +229,9 @@ async function refresh() {
       grid.innerHTML = ds.map(card).join('');
     }
 
+    updateTargets(ds);
+    await loadSchedules();
+
     const online = ds.filter(d => d.online).length;
     document.getElementById('totals').innerHTML =
       `<b>${online}</b>/${ds.length} online · <b>${fmt(j.total_power_w, 1)}</b> W total`;
@@ -218,6 +259,104 @@ grid.addEventListener('click', async ev => {
     }
   } finally {
     await refresh();
+  }
+});
+
+// ---- schedules -----------------------------------------------------------
+const DAY_NAMES = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
+const sched = document.getElementById('sched');
+const slist = document.getElementById('slist');
+const sTarget = document.getElementById('s-target');
+document.getElementById('s-days').innerHTML = DAY_NAMES.map((n, i) =>
+  `<label><input type="checkbox" value="${i}" checked>${n}</label>`).join('');
+
+// Keyed "mac" for a plug or a whole strip, "mac|socket id" for one socket.
+let targetNames = {};
+
+function updateTargets(ds) {
+  const opts = [];
+  for (const d of ds) {
+    const name = d.alias || d.host;
+    const kids = d.children || [];
+    opts.push([d.mac, kids.length ? `${name} (all sockets)` : name]);
+    for (const c of kids) opts.push([`${d.mac}|${c.id}`, `${name} › ${c.alias || 'socket'}`]);
+  }
+  const next = Object.fromEntries(opts);
+  // Rebuilding the <select> on every refresh would reset what the user picked.
+  if (JSON.stringify(next) === JSON.stringify(targetNames)) return;
+  targetNames = next;
+  const keep = sTarget.value;
+  sTarget.innerHTML = opts.map(([k, n]) => `<option value="${esc(k)}">${esc(n)}</option>`).join('');
+  if (keep in next) sTarget.value = keep;
+}
+
+function daysLabel(days) {
+  if (days === '0123456') return 'every day';
+  if (days === '01234') return 'weekdays';
+  if (days === '56') return 'weekends';
+  return [...days].map(i => DAY_NAMES[i]).join(', ');
+}
+
+function srow(s) {
+  const name = targetNames[s.child_id ? `${s.mac}|${s.child_id}` : s.mac] || `unknown device ${s.mac}`;
+  const bad = (s.last_result || '').startsWith('failed');
+  const last = !s.last_result ? 'not run yet'
+    : bad ? s.last_result : `last ran ${s.last_fired} ${s.last_result}`;
+  return `<div class="srow ${s.enabled ? '' : 'paused'}">
+    <span class="when">${esc(s.at)}</span>
+    <span class="what">Turn <b>${esc(s.action)}</b> ${esc(name)} · ${esc(daysLabel(s.days))}</span>
+    <span class="last ${bad ? 'bad' : ''}">${esc(last)}</span>
+    <button data-sid="${s.id}" data-sact="${s.enabled ? 'pause' : 'resume'}">${s.enabled ? 'Pause' : 'Resume'}</button>
+    <button data-sid="${s.id}" data-sact="delete">Delete</button>
+  </div>`;
+}
+
+async function loadSchedules() {
+  const j = await (await fetch('/api/schedules')).json();
+  sched.hidden = !j.enabled;
+  document.getElementById('s-tz').textContent = `times are ${j.timezone} · now ${j.now}`;
+  const rows = j.schedules || [];
+  slist.innerHTML = rows.length ? rows.map(srow).join('') : '<div class="last">No schedules yet.</div>';
+}
+
+async function schedRequest(url, opts, what) {
+  const r = await fetch(url, opts);
+  if (!r.ok) {
+    const j = await r.json().catch(() => ({}));
+    errBox.style.display = 'block';
+    errBox.textContent = `${what} failed: ${typeof j.detail === 'string' ? j.detail : r.status}`;
+  }
+  await loadSchedules();
+}
+
+document.getElementById('sform').addEventListener('submit', async ev => {
+  ev.preventDefault();
+  const [mac, child_id] = sTarget.value.split('|');
+  const days = [...document.querySelectorAll('#s-days input:checked')].map(i => i.value).join('');
+  await schedRequest('/api/schedules', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      mac, child_id: child_id || null, days,
+      action: document.getElementById('s-action').value,
+      at: document.getElementById('s-at').value,
+    }),
+  }, 'Adding schedule');
+});
+
+slist.addEventListener('click', async ev => {
+  const btn = ev.target.closest('button[data-sid]');
+  if (!btn) return;
+  btn.disabled = true;
+  const url = `/api/schedules/${btn.dataset.sid}`;
+  if (btn.dataset.sact === 'delete') {
+    await schedRequest(url, { method: 'DELETE' }, 'Deleting schedule');
+  } else {
+    await schedRequest(url, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ enabled: btn.dataset.sact === 'resume' }),
+    }, 'Updating schedule');
   }
 });
 

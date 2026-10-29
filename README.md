@@ -24,6 +24,9 @@ Tapo plugs supported by python-kasa should work.
   buttons switch every socket.
 - Shows offline devices as offline instead of silently dropping them, and
   forgets them once they have missed discovery for `STALE_AFTER` seconds.
+- **Schedules**: switch any plug, a whole strip, or a single strip socket on or
+  off at a time of day on chosen weekdays. Rules run inside the dashboard, so
+  they fire whether or not anyone has the page open.
 - Optional view-only mode (`ALLOW_CONTROL=false`).
 
 ## Quick start
@@ -32,11 +35,11 @@ Requires Docker with the Compose plugin, on a Linux host in the same broadcast
 domain as the plugs.
 
 ```sh
-git clone https://github.com/<you>/tapo-dash.git
+git clone https://github.com/gordon-n-stevenson/tapo-dash.git
 cd tapo-dash
 cp tapo.env.example tapo.env
 chmod 600 tapo.env
-$EDITOR tapo.env            # your Tapo account email and password
+$EDITOR tapo.env            # Tapo account email/password, and TZ for schedules
 docker compose up -d --build
 ```
 
@@ -65,6 +68,7 @@ rejected, set `TAPO_LOCAL_USERNAME` / `TAPO_LOCAL_PASSWORD`.
 | `TAPO_EMAIL` / `TAPO_PASSWORD` | — | Tapo cloud account |
 | `TAPO_LOCAL_USERNAME` / `TAPO_LOCAL_PASSWORD` | falls back to cloud | For firmware requiring Third-Party Compatibility |
 | `DASHBOARD_TITLE` | `Tapo Plugs` | Page heading and browser tab title |
+| `TZ` | `UTC` | Timezone schedules run in, e.g. `Europe/London` |
 | `ALLOW_CONTROL` | `true` | Set `false` for a view-only dashboard |
 | `PORT` | `8080` | Listen port (also update the compose healthcheck) |
 | `POLL_INTERVAL` | `10` | Seconds between device polls |
@@ -85,8 +89,25 @@ rejected, set `TAPO_LOCAL_USERNAME` / `TAPO_LOCAL_PASSWORD`.
 - `POST /api/devices/{mac}/{on|off|toggle}` — on a strip, switches every socket
 - `POST /api/devices/{mac}/children/{child_id}/{on|off|toggle}` — one strip socket
 - `POST /api/rediscover` — force a network scan
+- `GET /api/schedules` — all rules, plus the timezone they run in
+- `POST /api/schedules` — `{"mac", "child_id"?, "action": "on|off", "at": "HH:MM", "days": "01234"}` (Monday=0; omit `child_id` for a plug or a whole strip)
+- `PATCH /api/schedules/{id}` — `{"enabled": false}` to pause, `true` to resume
+- `DELETE /api/schedules/{id}`
 
 `{mac}` is the plug's MAC without separators, as returned by `/api/devices`.
+
+## Schedules
+
+Add rules from the **Schedules** section under the plug cards. Times are in
+the container's timezone, so set `TZ` in `tapo.env` (the header shows which
+zone is in use). Rules are stored in the same SQLite file as the power history
+and need `ALLOW_CONTROL=true`.
+
+If a plug is unreachable when a rule is due, the dashboard keeps retrying for
+10 minutes, then gives up until the rule's next day; the failure is shown next
+to the rule. Rules missed while the container was down are not replayed.
+Schedules are not written to the plugs, so they only run while the dashboard is
+running; schedules set in the Tapo app keep working independently.
 
 ## Security
 
