@@ -43,28 +43,36 @@ def validate(action: str, at: str, days: str) -> str:
     """Check a rule's fields and return the days in canonical order."""
     if action not in ("on", "off"):
         raise ValueError("action must be 'on' or 'off'")
-    if not _TIME_RE.match(at or ""):
+    if not _TIME_RE.fullmatch(at or ""):
         raise ValueError("at must be HH:MM (24-hour)")
     if not days or any(d not in ALL_DAYS for d in days):
         raise ValueError("days must be digits 0-6 (Monday=0), at least one")
     return "".join(sorted(set(days)))
 
 
-def fire_time(rule: dict[str, Any], day: date, tz: Any) -> datetime:
-    hour, minute = (int(x) for x in rule["at"].split(":"))
+def fire_time(at: str, day: date, tz: Any) -> datetime:
+    hour, minute = (int(x) for x in at.split(":"))
     return datetime.combine(day, time(hour, minute), tzinfo=tz)
 
 
-def is_due(rule: dict[str, Any], now: datetime) -> bool:
+def due_on(rule: dict[str, Any], now: datetime) -> date | None:
+    """The day whose run of this rule is due right now, or None.
+
+    Yesterday is checked too, so a 23:55 rule keeps its retry window past
+    midnight. Known limit: a time inside the hour skipped when DST starts
+    does not fire that day.
+    """
     if not rule["enabled"]:
-        return False
-    today = now.date()
-    if str(today.weekday()) not in rule["days"]:
-        return False
-    if rule["last_fired"] == today.isoformat():
-        return False
-    at = fire_time(rule, today, now.tzinfo)
-    return at <= now < at + GRACE
+        return None
+    for day in (now.date(), now.date() - timedelta(days=1)):
+        if str(day.weekday()) not in rule["days"]:
+            continue
+        if rule["last_fired"] and rule["last_fired"] >= day.isoformat():
+            continue
+        at = fire_time(rule["at"], day, now.tzinfo)
+        if at <= now < at + GRACE:
+            return day
+    return None
 
 
 def list_all(conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -89,10 +97,10 @@ def add(
     now: datetime,
 ) -> dict[str, Any]:
     days = validate(action, at, days)
-    # A rule created after its time today waits until its next day rather
-    # than firing straight away.
-    rule = {"at": at}
-    last_fired = now.date().isoformat() if fire_time(rule, now.date(), now.tzinfo) <= now else None
+    # A rule created inside its own grace window waits until its next day
+    # rather than firing straight away.
+    due = due_on({"enabled": 1, "at": at, "days": days, "last_fired": None}, now)
+    last_fired = due.isoformat() if due else None
     cur = conn.execute(
         "INSERT INTO schedules (mac, child_id, action, at, days, last_fired)"
         " VALUES (?, ?, ?, ?, ?, ?)",
@@ -102,12 +110,25 @@ def add(
     return get(conn, cur.lastrowid)
 
 
-def set_enabled(conn: sqlite3.Connection, rule_id: int, enabled: bool) -> bool:
-    cur = conn.execute(
-        "UPDATE schedules SET enabled = ? WHERE id = ?", (1 if enabled else 0, rule_id)
+def set_enabled(
+    conn: sqlite3.Connection, rule_id: int, enabled: bool, now: datetime
+) -> bool:
+    rule = get(conn, rule_id)
+    if rule is None:
+        return False
+    last_fired = rule["last_fired"]
+    if enabled and not rule["enabled"]:
+        # Same as add(): resuming inside the grace window must not switch
+        # the plug immediately, so treat that run as already done.
+        due = due_on({**rule, "enabled": 1}, now)
+        if due:
+            last_fired = due.isoformat()
+    conn.execute(
+        "UPDATE schedules SET enabled = ?, last_fired = ? WHERE id = ?",
+        (1 if enabled else 0, last_fired, rule_id),
     )
     conn.commit()
-    return cur.rowcount > 0
+    return True
 
 
 def delete(conn: sqlite3.Connection, rule_id: int) -> bool:

@@ -73,6 +73,10 @@ STALE_AFTER = float(os.environ.get("STALE_AFTER", "3600"))
 templates = Jinja2Templates(directory="app/templates")
 
 
+class UnknownDevice(LookupError):
+    """No such plug or socket. Distinct from the KeyErrors a device can raise."""
+
+
 def norm_mac(mac: str | None) -> str:
     return (mac or "").replace(":", "").replace("-", "").upper()
 
@@ -323,7 +327,7 @@ class Registry:
     def by_mac(self, mac: str) -> Device:
         dev = self.devices.get(norm_mac(mac))
         if dev is None:
-            raise LookupError(f"unknown device {mac}")
+            raise UnknownDevice(f"unknown device {mac}")
         return dev
 
     async def close(self) -> None:
@@ -481,14 +485,14 @@ async def history(mac: str, hours: int = 6):
 async def switch(mac: str, action: str, child_id: str | None = None) -> dict[str, Any]:
     """Switch a plug, a whole strip, or one strip socket; return the new snapshot.
 
-    Raises LookupError for an unknown device or socket; anything else comes
+    Raises UnknownDevice for an unknown device or socket; anything else comes
     from talking to the device.
     """
     dev = registry.by_mac(mac)
     if child_id is not None:
         targets = [c for c in dev.children if c.device_id == child_id]
         if not targets:
-            raise LookupError(f"unknown socket {child_id}")
+            raise UnknownDevice(f"unknown socket {child_id}")
     else:
         # Switching a whole strip means switching every socket on it.
         targets = list(dev.children) or [dev]
@@ -508,10 +512,16 @@ async def _switch(mac: str, action: str, child_id: str | None = None) -> dict[st
         raise HTTPException(status_code=403, detail="control is disabled")
     try:
         return await switch(mac, action, child_id)
-    except LookupError as exc:
+    except UnknownDevice as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+# A failing rule is retried at most this often within its grace window, so an
+# unreachable plug does not stall every poll cycle on connection timeouts.
+SCHEDULE_RETRY_EVERY = 60.0
+_schedule_attempts: dict[int, float] = {}
 
 
 async def run_schedules() -> None:
@@ -520,18 +530,25 @@ async def run_schedules() -> None:
         return
     now = datetime.now().astimezone()
     for rule in schedules.list_all(DB):
-        if not schedules.is_due(rule, now):
+        day = schedules.due_on(rule, now)
+        if day is None:
             continue
+        if time.time() - _schedule_attempts.get(rule["id"], 0) < SCHEDULE_RETRY_EVERY:
+            continue
+        _schedule_attempts[rule["id"]] = time.time()
         target = rule["mac"] + (f"/{rule['child_id']}" if rule["child_id"] else "")
         try:
             await switch(rule["mac"], rule["action"], rule["child_id"])
+            fired_on, result = day.isoformat(), f"ok {now:%H:%M:%S}"
+            log.info("schedule %s: turned %s %s", rule["id"], rule["action"], target)
         except Exception as exc:  # noqa: BLE001
-            # Leave last_fired alone so the next cycle retries within GRACE.
+            # Leave last_fired alone so a later cycle retries within GRACE.
+            fired_on, result = None, f"failed: {_short_error(exc)}"
             log.warning("schedule %s (%s %s) failed: %s", rule["id"], rule["action"], target, exc)
-            schedules.record(DB, rule["id"], None, f"failed: {_short_error(exc)}")
-            continue
-        log.info("schedule %s: turned %s %s", rule["id"], rule["action"], target)
-        schedules.record(DB, rule["id"], now.date().isoformat(), f"ok {now:%H:%M:%S}")
+        try:
+            schedules.record(DB, rule["id"], fired_on, result)
+        except sqlite3.Error as exc:
+            log.warning("could not record schedule %s: %s", rule["id"], exc)
 
 
 @app.post("/api/devices/{mac}/on")
@@ -607,9 +624,10 @@ async def add_schedule(body: ScheduleIn):
 
 @app.patch("/api/schedules/{rule_id}")
 async def update_schedule(rule_id: int, body: ScheduleUpdate):
-    if not schedules.set_enabled(_schedules_db(), rule_id, body.enabled):
+    db = _schedules_db()
+    if not schedules.set_enabled(db, rule_id, body.enabled, datetime.now().astimezone()):
         raise HTTPException(status_code=404, detail=f"unknown schedule {rule_id}")
-    return schedules.get(DB, rule_id)
+    return schedules.get(db, rule_id)
 
 
 @app.delete("/api/schedules/{rule_id}", status_code=204)
