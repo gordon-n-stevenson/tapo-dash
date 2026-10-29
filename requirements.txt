@@ -1,0 +1,7 @@
+# Pinned to a commit of the TPAP pull request (python-kasa#1592): firmware from
+# late 2025 onwards (e.g. P300 1.4.2) only speaks TPAP, which no python-kasa
+# release supports yet. Switch back to a release once one includes TPAP.
+python-kasa @ https://github.com/ZeliardM/python-kasa/archive/602472c78820e5bcc9ae9cc12c7ed5bbd2eda4fc.tar.gz
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+jinja2==3.1.6

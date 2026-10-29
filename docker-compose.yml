@@ -1,0 +1,31 @@
+services:
+  tapo-dash:
+    build: .
+    image: tapo-dash:latest
+    container_name: tapo-dash
+    # Host networking is required: Tapo discovery relies on UDP broadcast,
+    # which does not cross Docker's bridge NAT.
+    network_mode: host
+    env_file:
+      - ./tapo.env
+    environment:
+      - PORT=8080
+      - ALLOW_CONTROL=true
+      - POLL_INTERVAL=10
+      - REDISCOVER_INTERVAL=300
+      - HISTORY_DB=/data/history.db
+      - HISTORY_DAYS=7
+      # Uncomment to unicast-sweep when broadcast misses plugs:
+      # - SWEEP_CIDRS=192.168.1.0/24
+    volumes:
+      - tapo-dash-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request;urllib.request.urlopen('http://127.0.0.1:8080/healthz',timeout=5)"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s
+
+volumes:
+  tapo-dash-data:

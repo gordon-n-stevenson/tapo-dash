@@ -1,0 +1,7 @@
+# Real credentials; copy tapo.env.example instead.
+tapo.env
+.env
+*.db
+__pycache__/
+*.pyc
+.venv/

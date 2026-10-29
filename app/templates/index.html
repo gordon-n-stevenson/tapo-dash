@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>{{ title }}</title>
+<style>
+  *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+  :root{
+    --bg:#0f1117; --surface:#171a23; --surface2:#1e222d; --border:#2a2f3d;
+    --text:#e6ebf2; --muted:#8b95a8; --on:#22c55e; --off:#4b5563;
+    --accent:#3b82f6; --warn:#f59e0b; --bad:#ef4444;
+  }
+  @media (prefers-color-scheme: light){
+    :root{--bg:#f6f7f9;--surface:#fff;--surface2:#f0f2f5;--border:#dfe3ea;
+          --text:#12151c;--muted:#5c6678}
+  }
+  body{background:var(--bg);color:var(--text);min-height:100vh;padding:1.5rem 1rem 3rem;
+       font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif}
+  .wrap{max-width:1100px;margin:0 auto}
+  header{display:flex;align-items:baseline;justify-content:space-between;
+         gap:1rem;flex-wrap:wrap;margin-bottom:.35rem}
+  h1{font-size:1.35rem;font-weight:700;letter-spacing:-.02em}
+  .sub{color:var(--muted);font-size:.82rem;margin-bottom:1.25rem}
+  .bar{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;margin-bottom:1.25rem}
+  button{font:inherit;cursor:pointer;border-radius:8px;border:1px solid var(--border);
+         background:var(--surface2);color:var(--text);padding:.45rem .85rem;font-size:.85rem}
+  button:hover:not(:disabled){border-color:var(--accent)}
+  button:disabled{opacity:.5;cursor:not-allowed}
+  .totals{margin-left:auto;color:var(--muted);font-size:.85rem}
+  .totals b{color:var(--text);font-variant-numeric:tabular-nums}
+  #err{display:none;background:rgba(239,68,68,.12);border:1px solid var(--bad);
+       color:var(--bad);padding:.7rem .9rem;border-radius:8px;font-size:.83rem;
+       margin-bottom:1rem;white-space:pre-wrap}
+  .grid{display:grid;gap:.9rem;grid-template-columns:repeat(auto-fill,minmax(265px,1fr))}
+  .card{background:var(--surface);border:1px solid var(--border);border-radius:12px;
+        padding:1rem;display:flex;flex-direction:column;gap:.75rem}
+  .card.offline{opacity:.55}
+  .top{display:flex;align-items:flex-start;gap:.6rem}
+  .dot{width:10px;height:10px;border-radius:50%;background:var(--off);flex:none;margin-top:.38rem}
+  .dot.on{background:var(--on);box-shadow:0 0 0 3px rgba(34,197,94,.18)}
+  .dot.err{background:var(--bad)}
+  .name{font-weight:600;font-size:.98rem;line-height:1.25;word-break:break-word}
+  .meta{color:var(--muted);font-size:.74rem;margin-top:.15rem;font-variant-numeric:tabular-nums}
+  .stats{display:flex;gap:1.2rem;flex-wrap:wrap}
+  .stat .k{color:var(--muted);font-size:.68rem;text-transform:uppercase;letter-spacing:.05em}
+  .stat .v{font-size:1.05rem;font-weight:650;font-variant-numeric:tabular-nums;margin-top:.1rem}
+  .spark{width:100%;height:34px;display:block}
+  .actions{display:flex;gap:.45rem;margin-top:auto}
+  .actions button{flex:1}
+  .btn-on[data-active="1"]{background:var(--on);border-color:var(--on);color:#04220f}
+  .btn-off[data-active="1"]{background:var(--off);border-color:var(--off);color:var(--text)}
+  .sockets{display:flex;flex-direction:column;gap:.4rem}
+  .socket{display:flex;align-items:center;gap:.5rem;background:var(--surface2);
+          border:1px solid var(--border);border-radius:8px;padding:.35rem .5rem}
+  .socket .dot{margin-top:0}
+  .socket .sname{flex:1;min-width:0;font-size:.85rem;word-break:break-word}
+  .socket button{padding:.25rem .6rem;font-size:.78rem}
+  .errline{color:var(--bad);font-size:.72rem;word-break:break-word}
+  .empty{color:var(--muted);text-align:center;padding:3rem 1rem;font-size:.9rem;line-height:1.6}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>{{ title }}</h1>
+    <div class="totals" id="totals"></div>
+  </header>
+  <div class="sub" id="sub">Loading…</div>
+
+  <div class="bar">
+    <button id="refresh">Refresh</button>
+    <button id="rediscover">Re-scan network</button>
+    <label style="font-size:.82rem;color:var(--muted);display:flex;gap:.4rem;align-items:center">
+      <input type="checkbox" id="auto" checked> auto-refresh
+    </label>
+  </div>
+
+  <div id="err"></div>
+  <div class="grid" id="grid"></div>
+  <div class="empty" id="empty" style="display:none"></div>
+</div>
+
+<script>
+const ALLOW_CONTROL = {{ 'true' if allow_control else 'false' }};
+const grid = document.getElementById('grid');
+const errBox = document.getElementById('err');
+const emptyBox = document.getElementById('empty');
+const histCache = {};
+
+// Plug names and device errors are free text; never let them become markup.
+const esc = v => String(v ?? '').replace(/[&<>"']/g,
+  c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const fmt = (v, d = 1) => (v === null || v === undefined) ? '—' : Number(v).toFixed(d);
+const ago = ts => {
+  if (!ts) return 'never';
+  const s = Math.max(0, Math.round(Date.now() / 1000 - ts));
+  if (s < 60) return s + 's ago';
+  if (s < 3600) return Math.round(s / 60) + 'm ago';
+  return Math.round(s / 3600) + 'h ago';
+};
+
+function sparkline(points) {
+  const vals = points.map(p => p.power_w).filter(v => v !== null && v !== undefined);
+  if (vals.length < 2) return '';
+  const max = Math.max(...vals, 0.1), min = Math.min(...vals, 0);
+  const span = (max - min) || 1;
+  const step = 100 / (vals.length - 1);
+  const d = vals.map((v, i) =>
+    `${(i * step).toFixed(2)},${(30 - ((v - min) / span) * 26).toFixed(2)}`).join(' L');
+  return `<svg class="spark" viewBox="0 0 100 34" preserveAspectRatio="none">
+    <polyline points="0,34 ${d.replaceAll(' L', ' ')} 100,34" fill="rgba(59,130,246,.15)" stroke="none"/>
+    <path d="M${d}" fill="none" stroke="var(--accent)" stroke-width="1.4"
+          vector-effect="non-scaling-stroke" stroke-linejoin="round"/>
+  </svg>`;
+}
+
+function card(d) {
+  const on = d.is_on, off = !d.online;
+  const dotCls = off ? 'dot err' : (on ? 'dot on' : 'dot');
+  const energy = d.has_energy ? `
+    <div class="stats">
+      <div class="stat"><div class="k">Now</div><div class="v">${fmt(d.power_w, 1)}<small> W</small></div></div>
+      <div class="stat"><div class="k">Today</div><div class="v">${fmt(d.today_kwh, 2)}<small> kWh</small></div></div>
+      <div class="stat"><div class="k">Month</div><div class="v">${fmt(d.month_kwh, 2)}<small> kWh</small></div></div>
+    </div>${histCache[d.mac] || ''}` : '';
+  const kids = d.children || [];
+  const allOn = kids.length ? kids.every(c => c.is_on) : on;
+  const all = kids.length ? 'All ' : '';
+  const sockets = kids.length ? `
+    <div class="sockets">${kids.map(c => `
+      <div class="socket">
+        <div class="${off ? 'dot err' : (c.is_on ? 'dot on' : 'dot')}"></div>
+        <div class="sname">${esc(c.alias || "(unnamed socket)")}</div>
+        ${ALLOW_CONTROL ? `
+        <button class="btn-on"  data-active="${c.is_on ? 1 : 0}" data-mac="${d.mac}" data-child="${esc(c.id)}" data-act="on"  ${off ? 'disabled' : ''}>On</button>
+        <button class="btn-off" data-active="${!c.is_on && d.online ? 1 : 0}" data-mac="${d.mac}" data-child="${esc(c.id)}" data-act="off" ${off ? 'disabled' : ''}>Off</button>` : ''}
+      </div>`).join('')}
+    </div>` : '';
+  const controls = ALLOW_CONTROL ? `
+    <div class="actions">
+      <button class="btn-on"  data-active="${allOn ? 1 : 0}" data-mac="${d.mac}" data-act="on"  ${off ? 'disabled' : ''}>${all}On</button>
+      <button class="btn-off" data-active="${!on && d.online ? 1 : 0}" data-mac="${d.mac}" data-act="off" ${off ? 'disabled' : ''}>${all}Off</button>
+    </div>` : '';
+  const state = kids.length
+    ? `${kids.filter(c => c.is_on).length}/${kids.length} on`
+    : (on ? 'on' : 'off');
+  return `<div class="card ${off ? 'offline' : ''}">
+    <div class="top">
+      <div class="${dotCls}"></div>
+      <div style="min-width:0">
+        <div class="name">${esc(d.alias || "(unnamed)")}</div>
+        <div class="meta">${esc(d.model || '?')} · ${esc(d.host)} · ${d.rssi != null ? d.rssi + ' dBm · ' : ''}${off ? 'offline' : state}</div>
+      </div>
+    </div>
+    ${energy}
+    ${sockets}
+    ${d.error ? `<div class="errline">${esc(d.error)}</div>` : ''}
+    ${controls}
+  </div>`;
+}
+
+async function loadHistory(devices) {
+  await Promise.all(devices.filter(d => d.has_energy).map(async d => {
+    try {
+      const r = await fetch(`/api/devices/${d.mac}/history?hours=6`);
+      const j = await r.json();
+      histCache[d.mac] = sparkline(j.points || []);
+    } catch (e) { /* sparkline is optional */ }
+  }));
+}
+
+async function refresh() {
+  try {
+    const r = await fetch('/api/devices');
+    const j = await r.json();
+
+    if (j.error) { errBox.style.display = 'block'; errBox.textContent = j.error; }
+    else errBox.style.display = 'none';
+
+    const ds = j.devices || [];
+    if (!ds.length) {
+      grid.innerHTML = '';
+      emptyBox.style.display = 'block';
+      emptyBox.innerHTML = j.error
+        ? 'No plugs are reporting. See the error above.'
+        : 'No plugs found yet — the first scan can take a few seconds.<br>Try “Re-scan network”.';
+    } else {
+      emptyBox.style.display = 'none';
+      await loadHistory(ds);
+      grid.innerHTML = ds.map(card).join('');
+    }
+
+    const online = ds.filter(d => d.online).length;
+    document.getElementById('totals').innerHTML =
+      `<b>${online}</b>/${ds.length} online · <b>${fmt(j.total_power_w, 1)}</b> W total`;
+    document.getElementById('sub').textContent =
+      `Polled ${ago(j.last_poll)} · last network scan ${ago(j.last_discovery)}` +
+      (ALLOW_CONTROL ? '' : ' · view-only');
+  } catch (e) {
+    errBox.style.display = 'block';
+    errBox.textContent = 'Cannot reach the dashboard API: ' + e;
+  }
+}
+
+grid.addEventListener('click', async ev => {
+  const btn = ev.target.closest('button[data-mac]');
+  if (!btn) return;
+  const nodes = grid.querySelectorAll('button');
+  nodes.forEach(b => b.disabled = true);
+  try {
+    const child = btn.dataset.child ? `/children/${encodeURIComponent(btn.dataset.child)}` : '';
+    const r = await fetch(`/api/devices/${btn.dataset.mac}${child}/${btn.dataset.act}`, { method: 'POST' });
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      errBox.style.display = 'block';
+      errBox.textContent = `Switch failed: ${j.detail || r.status}`;
+    }
+  } finally {
+    await refresh();
+  }
+});
+
+document.getElementById('refresh').onclick = refresh;
+document.getElementById('rediscover').onclick = async ev => {
+  ev.target.disabled = true;
+  ev.target.textContent = 'Scanning…';
+  try { await fetch('/api/rediscover', { method: 'POST' }); await refresh(); }
+  finally { ev.target.disabled = false; ev.target.textContent = 'Re-scan network'; }
+};
+
+let timer = setInterval(refresh, 5000);
+document.getElementById('auto').onchange = e => {
+  clearInterval(timer);
+  if (e.target.checked) timer = setInterval(refresh, 5000);
+};
+refresh();
+</script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+tapo.env
+.env
+*.db
+.git
+__pycache__/
