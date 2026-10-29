@@ -9,6 +9,13 @@ Built on [python-kasa](https://github.com/python-kasa/python-kasa). Tested with
 the **P100**, **P110** (energy monitoring) and **P300** (3-socket strip); other
 Tapo plugs supported by python-kasa should work.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/screenshot-dark.png">
+  <img alt="Dashboard showing plug cards with on/off switches, a power strip with per-socket controls, a power graph for an energy-monitoring plug, an offline plug, and a list of schedules" src="docs/screenshot-light.png">
+</picture>
+
+<sub>Demo data. Plug names and addresses are illustrative.</sub>
+
 ## Features
 
 - Discovers plugs by UDP broadcast (several rounds, since a single round is
@@ -27,6 +34,9 @@ Tapo plugs supported by python-kasa should work.
 - **Schedules**: switch any plug, a whole strip, or a single strip socket on or
   off at a time of day on chosen weekdays. Rules run inside the dashboard, so
   they fire whether or not anyone has the page open.
+- **Edit layout**: rename plugs and sockets and drag cards into your own order.
+  Names set here override the plug's own, which helps for a P300 (the Tapo app
+  only names its sockets) and for plugs paired to another account.
 - Optional view-only mode (`ALLOW_CONTROL=false`).
 
 ## Quick start
@@ -93,6 +103,8 @@ rejected, set `TAPO_LOCAL_USERNAME` / `TAPO_LOCAL_PASSWORD`.
 - `POST /api/schedules` — `{"mac", "child_id"?, "action": "on|off", "at": "HH:MM", "days": "01234"}` (Monday=0; omit `child_id` for a plug or a whole strip)
 - `PATCH /api/schedules/{id}` — `{"enabled": false}` to pause, `true` to resume
 - `DELETE /api/schedules/{id}`
+- `PUT /api/devices/{mac}/name`: `{"name", "child_id"?}` sets a dashboard name; blank or `null` reverts to the plug's own
+- `PUT /api/layout`: `{"order": [mac, ...]}` sets the card order; `[]` resets it to alphabetical
 
 `{mac}` is the plug's MAC without separators, as returned by `/api/devices`.
 
@@ -105,9 +117,19 @@ and need `ALLOW_CONTROL=true`.
 
 If a plug is unreachable when a rule is due, the dashboard keeps retrying for
 10 minutes, then gives up until the rule's next day; the failure is shown next
-to the rule. Rules missed while the container was down are not replayed.
+to the rule. Rules missed while the container was down are not replayed, and a rule set
+inside the hour that is skipped when daylight saving starts does not run that
+day.
 Schedules are not written to the plugs, so they only run while the dashboard is
 running; schedules set in the Tapo app keep working independently.
+
+## Edit layout
+
+Press **Edit layout** to rename plugs, strips and sockets, and to reorder the
+cards by dragging the handle or with the arrow keys. The on/off switches are
+hidden while editing, and changes save as you go. Names and order are stored in
+the dashboard's SQLite file, keyed by MAC, so they survive IP changes and apply
+to everyone viewing the dashboard.
 
 ## Security
 

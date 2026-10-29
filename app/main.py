@@ -26,7 +26,7 @@ from pydantic import BaseModel
 from kasa import Device, Discover, Module
 from kasa.exceptions import AuthenticationError
 
-from app import schedules
+from app import layout, schedules
 
 log = logging.getLogger("tapo-dash")
 # uvicorn only configures its own loggers; without a root handler our info
@@ -366,6 +366,7 @@ def init_db() -> sqlite3.Connection | None:
 DB = init_db()
 if DB is not None:
     schedules.init(DB)
+    layout.init(DB)
 _last_history_write = 0.0
 
 
@@ -450,10 +451,34 @@ async def healthz():
     }
 
 
+def _fallback_name(d: dict[str, Any]) -> str:
+    model = d.get("model") or "Tapo"
+    return f"{model} power strip" if d.get("children") else f"{model} plug"
+
+
+def _with_names(state: dict[str, Any], names: dict[str, str]) -> dict[str, Any]:
+    """Copy of a snapshot with display names: custom, else device, else generic."""
+    d = dict(state)
+    d["default_name"] = d.get("alias") or _fallback_name(d)
+    d["custom_name"] = names.get(d["mac"])
+    d["name"] = d["custom_name"] or d["default_name"]
+    if d.get("children"):
+        kids = []
+        for i, c in enumerate(d["children"]):
+            custom = names.get(layout.key(d["mac"], c["id"]))
+            default = c.get("alias") or f"Socket {i + 1}"
+            kids.append({**c, "default_name": default, "custom_name": custom, "name": custom or default})
+        d["children"] = kids
+    return d
+
+
 @app.get("/api/devices")
 async def list_devices():
+    names = layout.names(DB) if DB is not None else {}
+    order = layout.positions(DB) if DB is not None else {}
     devices = sorted(
-        registry.state.values(), key=lambda d: (d.get("alias") or d.get("host") or "")
+        (_with_names(s, names) for s in registry.state.values()),
+        key=lambda d: layout.sort_key(order, d["mac"], d["name"]),
     )
     total = sum(d["power_w"] for d in devices if d.get("power_w") is not None)
     return {
@@ -634,6 +659,42 @@ async def update_schedule(rule_id: int, body: ScheduleUpdate):
 async def delete_schedule(rule_id: int):
     if not schedules.delete(_schedules_db(), rule_id):
         raise HTTPException(status_code=404, detail=f"unknown schedule {rule_id}")
+
+
+class NameIn(BaseModel):
+    name: str | None = None  # blank or null clears the custom name
+    child_id: str | None = None
+
+
+class OrderIn(BaseModel):
+    order: list[str]  # device MACs, first card first
+
+
+def _layout_db() -> sqlite3.Connection:
+    if not ALLOW_CONTROL:
+        raise HTTPException(status_code=403, detail="editing is disabled")
+    if DB is None:
+        raise HTTPException(status_code=503, detail="editing needs the history database")
+    return DB
+
+
+@app.put("/api/devices/{mac}/name")
+async def rename(mac: str, body: NameIn):
+    db = _layout_db()
+    key = norm_mac(mac)
+    state = registry.state.get(key)
+    if state is None:
+        raise HTTPException(status_code=404, detail=f"unknown device {mac}")
+    if body.child_id and body.child_id not in {c["id"] for c in state.get("children", [])}:
+        raise HTTPException(status_code=404, detail=f"unknown socket {body.child_id}")
+    return {"name": layout.set_name(db, layout.key(key, body.child_id), body.name)}
+
+
+@app.put("/api/layout")
+async def set_layout(body: OrderIn):
+    layout.set_order(_layout_db(), [norm_mac(m) for m in body.order if norm_mac(m)])
+    pos = layout.positions(DB)
+    return {"order": sorted(pos, key=pos.get)}
 
 
 @app.post("/api/rediscover")
